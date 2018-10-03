@@ -24,3 +24,6 @@ usage
 			session_redis_url=redis://@redis-ip:6379/0       ;same as master
 			ormcache_redis_url=redis://@redis-ip:6379/0      ;same as master
 			max_cron_threads = 0
+		5.use a nfs directory as data directory for master and slave(s) server(mount as a folder).
+		  odoo.conf:
+		       data_dir = data   ==> a nfs directory
