@@ -1,5 +1,5 @@
 # Odoo Cluster
-Open Source Odoo Cluster implement
+Open Source Odoo Cluster Implementation
 
 
 architecture;
