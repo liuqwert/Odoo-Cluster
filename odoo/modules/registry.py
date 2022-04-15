@@ -28,6 +28,7 @@ from odoo.tools import (assertion_report, lazy_classproperty, config,
 from odoo.tools.lru import LRU
 from odoo.tools.RedisLRU import RedisLRU
 import redis
+from redis.sentinel import Sentinel
 
 _logger = logging.getLogger(__name__)
 
@@ -143,9 +144,17 @@ class Registry(Mapping):
         self.cache_sequence = None
 
         #self.cache = LRU(8192)
-        r=redis.StrictRedis.from_url(odoo.tools.config['ormcache_redis_url'])
-        self.cache= RedisLRU(r,db_name)
 
+        if (odoo.tools.config.get('ormcache_redis_sentinel')):
+            sentinel = Sentinel([(odoo.tools.config['ormcache_redis_sentinel'], odoo.tools.config['ormcache_redis_sentinel_port']),],socket_timeout = 0.1)
+            master = sentinel.master_for('mymaster', socket_timeout=0.1)
+            self.cache = RedisLRU(master, db_name)
+        elif (odoo.tools.config.get('ormcache_redis_url')):
+            pool = redis.ConnectionPool(host=odoo.tools.config['ormcache_redis_url'])
+            master = redis.Redis(connection_pool=pool)
+            self.cache = RedisLRU(master, db_name)
+        else:
+            self.cache = LRU(8192)
         # Flag indicating if at least one model cache has been cleared.
         # Useful only in a multi-process context.
         self.cache_cleared = False
@@ -370,24 +379,29 @@ class Registry(Mapping):
         if not odoo.multi_process:
             return
 
-        with self.cursor() as cr:
-            # The `base_registry_signaling` sequence indicates when the registry
-            # must be reloaded.
-            # The `base_cache_signaling` sequence indicates when all caches must
-            # be invalidated (i.e. cleared).
-            cr.execute("SELECT sequence_name FROM information_schema.sequences WHERE sequence_name='base_registry_signaling'")
-            if not cr.fetchall():
-                cr.execute("CREATE SEQUENCE base_registry_signaling INCREMENT BY 1 START WITH 1")
-                cr.execute("SELECT nextval('base_registry_signaling')")
-                cr.execute("CREATE SEQUENCE base_cache_signaling INCREMENT BY 1 START WITH 1")
-                cr.execute("SELECT nextval('base_cache_signaling')")
+        if (isinstance(self.cache,RedisLRU)):
+            self.registry_sequence = self.cache.curRegisty()
+            _logger.debug("Multiprocess load registry signaling: [Registry: %s]", self.registry_sequence)
 
-            cr.execute(""" SELECT base_registry_signaling.last_value,
-                                  base_cache_signaling.last_value
-                           FROM base_registry_signaling, base_cache_signaling""")
-            self.registry_sequence, self.cache_sequence = cr.fetchone()
-            _logger.debug("Multiprocess load registry signaling: [Registry: %s] [Cache: %s]",
-                          self.registry_sequence, self.cache_sequence)
+
+        # with self.cursor() as cr:
+        #     # The `base_registry_signaling` sequence indicates when the registry
+        #     # must be reloaded.
+        #     # The `base_cache_signaling` sequence indicates when all caches must
+        #     # be invalidated (i.e. cleared).
+        #     cr.execute("SELECT sequence_name FROM information_schema.sequences WHERE sequence_name='base_registry_signaling'")
+        #     if not cr.fetchall():
+        #         cr.execute("CREATE SEQUENCE base_registry_signaling INCREMENT BY 1 START WITH 1")
+        #         cr.execute("SELECT nextval('base_registry_signaling')")
+        #         cr.execute("CREATE SEQUENCE base_cache_signaling INCREMENT BY 1 START WITH 1")
+        #         cr.execute("SELECT nextval('base_cache_signaling')")
+        #
+        #     cr.execute(""" SELECT base_registry_signaling.last_value,
+        #                           base_cache_signaling.last_value
+        #                    FROM base_registry_signaling, base_cache_signaling""")
+        #     self.registry_sequence, self.cache_sequence = cr.fetchone()
+        #     _logger.debug("Multiprocess load registry signaling: [Registry: %s] [Cache: %s]",
+        #                   self.registry_sequence, self.cache_sequence)
 
     def check_signaling(self):
         """ Check whether the registry has changed, and performs all necessary
@@ -396,24 +410,37 @@ class Registry(Mapping):
         if not odoo.multi_process:
             return self
 
-        with closing(self.cursor()) as cr:
-            cr.execute(""" SELECT base_registry_signaling.last_value,
-                                  base_cache_signaling.last_value
-                           FROM base_registry_signaling, base_cache_signaling""")
-            r, c = cr.fetchone()
-            _logger.debug("Multiprocess signaling check: [Registry - %s -> %s] [Cache - %s -> %s]",
-                          self.registry_sequence, r, self.cache_sequence, c)
+        if (isinstance(self.cache,RedisLRU)):
+            r = self.cache.curRegisty()
+            _logger.debug("Multiprocess signaling check: [Registry - %s -> %s]",
+                          self.registry_sequence, r )
             # Check if the model registry must be reloaded
             if self.registry_sequence != r:
                 _logger.info("Reloading the model registry after database signaling.")
                 self = Registry.new(self.db_name)
-            # Check if the model caches must be invalidated.
-            elif self.cache_sequence != c:
-                _logger.info("Invalidating all model caches after database signaling.")
-                self.clear_caches()
-                self.cache_cleared = False
-            self.registry_sequence = r
-            self.cache_sequence = c
+                self.registry_sequence = r
+
+        # with closing(self.cursor()) as cr:
+        #     # cr.execute(""" SELECT base_registry_signaling.last_value,
+        #     #                       base_cache_signaling.last_value
+        #     #                FROM base_registry_signaling, base_cache_signaling""")
+        #     # r, c = cr.fetchone()
+        #     cr.execute(""" SELECT base_registry_signaling.last_value
+        #                    FROM base_registry_signaling """)
+        #     r = cr.fetchone()
+        #     _logger.debug("Multiprocess signaling check: [Registry - %s -> %s]",
+        #                   self.registry_sequence, r )
+        #     # Check if the model registry must be reloaded
+        #     if self.registry_sequence != r:
+        #         _logger.info("Reloading the model registry after database signaling.")
+        #         self = Registry.new(self.db_name)
+        #     # Check if the model caches must be invalidated.
+        #     # elif self.cache_sequence != c:
+        #     #     _logger.info("Invalidating all model caches after database signaling.")
+        #     #     self.clear_caches()
+        #     #     self.cache_cleared = False
+        #     self.registry_sequence = r
+        #     #self.cache_sequence = c
 
         return self
 
@@ -421,19 +448,24 @@ class Registry(Mapping):
         """ Notifies other processes that the registry has changed. """
         if odoo.multi_process:
             _logger.info("Registry changed, signaling through the database")
-            with closing(self.cursor()) as cr:
-                cr.execute("select nextval('base_registry_signaling')")
-                self.registry_sequence = cr.fetchone()[0]
+            if (isinstance(self.cache,RedisLRU)):
+                self.registry_sequence = self.cache.incrRegisty()
+                _logger.debug("Multiprocess signal_registry_change: [Registry: %s]", self.registry_sequence)
+
+            # with closing(self.cursor()) as cr:
+            #     cr.execute("select nextval('base_registry_signaling')")
+            #     self.registry_sequence = cr.fetchone()[0]
 
     def signal_caches_change(self):
-        """ Notifies other processes if caches have been invalidated. """
-        if odoo.multi_process and self.cache_cleared:
-            # signal it through the database to other processes
-            _logger.info("At least one model cache has been invalidated, signaling through the database.")
-            with closing(self.cursor()) as cr:
-                cr.execute("select nextval('base_cache_signaling')")
-                self.cache_sequence = cr.fetchone()[0]
-                self.cache_cleared = False
+        return
+        # """ Notifies other processes if caches have been invalidated. """
+        # if odoo.multi_process and self.cache_cleared:
+        #     # signal it through the database to other processes
+        #     _logger.info("At least one model cache has been invalidated, signaling through the database.")
+        #     with closing(self.cursor()) as cr:
+        #         cr.execute("select nextval('base_cache_signaling')")
+        #         self.cache_sequence = cr.fetchone()[0]
+        #         self.cache_cleared = False
 
     def in_test_mode(self):
         """ Test whether the registry is in 'test' mode. """

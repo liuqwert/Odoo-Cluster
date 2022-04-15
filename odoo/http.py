@@ -53,6 +53,7 @@ try:
 except ImportError:
     psutil = None
 import redis
+from redis.sentinel import Sentinel
 import odoo
 from odoo.service.server import memory_info
 from odoo.service import security, model as service_model
@@ -1188,17 +1189,18 @@ class OpenERPSession(werkzeug.contrib.sessions.Session):
 
 
 def session_gc(session_store):
-    return
-    # if random.random() < 0.001:
-    #     # we keep session one week
-    #     last_week = time.time() - 60*60*24*7
-    #     for fname in os.listdir(session_store.path):
-    #         path = os.path.join(session_store.path, fname)
-    #         try:
-    #             if os.path.getmtime(path) < last_week:
-    #                 os.unlink(path)
-    #         except OSError:
-    #             pass
+    if (odoo.tools.config.get('session_redis_sentinel') or odoo.tools.config.get('session_redis_url')):
+        return
+    if random.random() < 0.001:
+        # we keep session one week
+        last_week = time.time() - 60*60*24*7
+        for fname in os.listdir(session_store.path):
+            path = os.path.join(session_store.path, fname)
+            try:
+                if os.path.getmtime(path) < last_week:
+                    os.unlink(path)
+            except OSError:
+                pass
 
 #----------------------------------------------------------
 # WSGI Layer
@@ -1368,12 +1370,15 @@ class Root(object):
         db = httprequest.session.db
         # Check if session.db is legit
         if db:
-            if db not in db_filter([db], httprequest=httprequest):
+            httprequest = httprequest or request.httprequest
+            h = httprequest.environ.get('HTTP_HOST', '').split(':')[0]
+            d, _, r = h.partition('.')
+            #_logger.debug("d, _, r:", d, _, r)
+            if db not in db_filter([db], httprequest=httprequest)  and (not d.isdigit()):
                 _logger.warn("Logged into database '%s', but dbfilter "
                              "rejects it; logging session out.", db)
                 httprequest.session.logout()
                 db = None
-
         if not db:
             httprequest.session.db = db_monodb(httprequest)
 
@@ -1511,6 +1516,7 @@ def db_list(force=False, httprequest=None):
 def db_filter(dbs, httprequest=None):
     httprequest = httprequest or request.httprequest
     h = httprequest.environ.get('HTTP_HOST', '').split(':')[0]
+    _logger.debug("HTTP_HOST: %s,dbs:%s", h,dbs)
     d, _, r = h.partition('.')
     if d == "www" and r:
         d = r.partition('.')[0]
@@ -1668,7 +1674,7 @@ class CommonController(Controller):
         return nsession.sid
 
 ####################################cluster####################################
-SESSION_TIMEOUT = 60*60*24*7 # 7 weeks in seconds
+SESSION_TIMEOUT = 60*60*4 # 4 hour
 
 class RedisSessionStore(werkzeug.contrib.sessions.SessionStore):
 
@@ -1686,8 +1692,7 @@ class RedisSessionStore(werkzeug.contrib.sessions.SessionStore):
     def save(self, session):
 
         key = self.get_session_key(session.sid)
-        if self.redis.set(key, json.dumps(dict(session))):
-            return self.redis.expire(key, SESSION_TIMEOUT)
+        return self.redis.set(key, json.dumps(dict(session)),ex=SESSION_TIMEOUT)
 
     def delete(self, session):
         key = self.get_session_key(session.sid)
@@ -1711,12 +1716,24 @@ class RedisSessionStore(werkzeug.contrib.sessions.SessionStore):
 
 class ClusterRoot(Root):
 
+    def __init__(self):
+        super(ClusterRoot,self).__init__()
+        if (odoo.tools.config.get('session_redis_sentinel')):
+            sentinel = Sentinel([(odoo.tools.config['session_redis_sentinel'], odoo.tools.config['session_redis_sentinel_port']),],socket_timeout = 0.1)
+            master = sentinel.master_for('mymaster', socket_timeout=0.1)
+        else:
+            pool = redis.ConnectionPool(host=odoo.tools.config['session_redis_url'])   #实现一个连接池
+            master = redis.Redis(connection_pool=pool)
+        self._sessionStore= RedisSessionStore(master, session_class=OpenERPSession)
+
     @lazy_property
     def session_store(self):
-        _logger.debug('HTTP sessions stored in Redis: %s', )
-        r = redis.StrictRedis.from_url(odoo.tools.config['session_redis_url'])
-        sessionStore= RedisSessionStore(r, session_class=OpenERPSession)
-        return sessionStore
+        _logger.debug('HTTP sessions stored in Redis')
+        return self._sessionStore
+
+
 #  main wsgi handler
-#root = Root()
-root = ClusterRoot()
+if ( odoo.tools.config.get('session_redis_sentinel') or odoo.tools.config.get('session_redis_url')):
+    root = ClusterRoot()
+else:
+    root = Root()
